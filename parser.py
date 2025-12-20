@@ -63,24 +63,24 @@ class Parser:
                 parse_error.append(self.columns.index("date"))
 
             # Term
-            m = re.search(r"ترمی که دانشجو با این استاد کلاس داشته:\s*┘\s*(.+)", text)
+            m = re.search(r"ترم[^\n]*\n?\s*┘\s*([^\n\r]+)", text)
             term = m.group(1).strip() if m else None
             if not term:
                 parse_error.append(self.columns.index("term"))
 
             # Professor name
-            m = re.search(r"🧑‍🏫\s*(.+)", text)
+            m = re.search(r"(?:🧑‍🏫\s*)?([^\n\r]+)\n?\s*🏫", text)
             professor_name_raw = m.group(1).strip() if m else None
             if not professor_name_raw:
                 parse_error.append(self.columns.index("professor_name_raw"))
 
             # Department
-            m = re.search(r"#([^\s\n]+)", text)
-            department = m.group(1) if m else None
+            m = re.search(r"#([^\s#]+)", text)
+            department = m.group(1).strip() if m else None
             if not department:
                 parse_error.append(self.columns.index("department"))
 
-            # Course name
+            # Course name (بدون تغییر)
             m = re.search(r"📒\s*(.+)", text)
             course_name = m.group(1).strip() if m else None
             if not course_name:
@@ -104,7 +104,7 @@ class Parser:
             if not comment_text:
                 parse_error.append(self.columns.index("comment_text"))
 
-            # Ratings per dimension
+            # Ratings
             ratings = {}
             for col, label in self.rating_lbl.items():
                 m = re.search(fr"{label}[^\d]*(\d{{1,2}})", text)
