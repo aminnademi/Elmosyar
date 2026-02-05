@@ -34,6 +34,8 @@ def load_data(path):
     return df
 
 df = load_data(DATA_PATH)
+safe_label = lambda x: "نامشخص" if pd.isna(x) else str(x)
+
 
 # =============================
 # Aggregations
@@ -124,29 +126,61 @@ if page == "Overview":
 # =============================
 # Search & Filter
 # =============================
+
 elif page == "Search & Filter":
     st.header("Search & Filter")
 
-    q = st.text_input("Search professor or course")
+    q = st.text_input("Search professor or course (partial match)")
+
+    sort_by = st.selectbox("Sort results by", ["Overall score", "Number of distinct courses"], index=0)
+    min_courses = st.number_input("Minimum distinct courses to show", min_value=0, value=0, step=1)
+    top_k = st.number_input("Show top K courses in the detail", min_value=1, value=3, step=1)
 
     subset = df_f.copy()
-    if q:
-        subset = subset[
-            subset["professor"].str.contains(q, case=False, na=False) |
-            subset["course"].str.contains(q, case=False, na=False)
-        ]
 
-    profs = professor_aggregate(subset).sort_values("overall_score", ascending=False)
+    if q:
+        mask_q = (
+            subset["professor"].fillna("").str.contains(q, case=False, na=False) |
+            subset["course"].fillna("").str.contains(q, case=False, na=False)
+        )
+        subset = subset[mask_q]
+
+    profs = professor_aggregate(subset)
+
+    course_counts = subset.groupby("professor")["course"].nunique().rename("n_courses")
+    profs = profs.merge(course_counts, how="left", left_on="professor", right_index=True)
+    profs["n_courses"] = profs["n_courses"].fillna(0).astype(int)
+
+    if min_courses > 0:
+        profs = profs[profs["n_courses"] >= int(min_courses)]
+
+    if sort_by == "Number of distinct courses":
+        profs = profs.sort_values(["n_courses", "overall_score"], ascending=[False, False])
+    else:
+        profs = profs.sort_values(["overall_score", "n_courses"], ascending=[False, False])
+
+    st.write(f"Found {len(profs)} professors matching filters")
 
     for _, r in profs.iterrows():
-        with st.expander(f"{r['professor']} — ⭐ {r['overall_score']:.2f}"):
-            st.write("Comments:", int(r["n_comments"]))
+        header = f"{r['professor']} — ⭐ {r['overall_score']:.2f} — courses: {int(r['n_courses'])} — comments: {int(r['n_comments'])}"
+        with st.expander(header):
             st.write("Mean sentiment:", round(r["mean_sentiment"], 2))
             st.write("Grading:", r["grading_mode"])
             st.write("Attendance:", r["attendance_mode"])
 
-            courses = subset[subset["professor"] == r["professor"]]["course"].unique()
-            st.write("Courses:", "، ".join(courses))
+            courses_series = (
+                subset[subset["professor"] == r["professor"]]["course"]
+                .fillna("")
+                .value_counts()
+            )
+            top_courses = courses_series.head(top_k).index.tolist()
+            st.write("Top courses:", "، ".join([c for c in top_courses if c]))
+
+            if not courses_series.empty:
+                cs_df = courses_series.reset_index()
+                cs_df.columns = ["course", "count"]
+                st.table(cs_df.head(20))
+
 
 # =============================
 # Professor Profile
@@ -231,38 +265,68 @@ elif page == "Compare":
 elif page == "Recommender":
     st.header("Recommender")
 
+    st.markdown("Choose preferences and optionally a course. If a course is selected, the recommender ranks professors who taught that course.")
+
     w_overall = st.slider("Overall score importance", 0.0, 1.0, 0.5)
     w_teaching = st.slider("Teaching importance", 0.0, 1.0, 0.5)
+    w_sentiment = st.slider("Student sentiment importance", 0.0, 1.0, 0.0)
 
-    prof_agg["teaching_mean"] = (
-        df_f.groupby("professor")["teaching"].mean()
-        .reindex(prof_agg["professor"])
-        .values
-    )
+    courses_list = sorted(df_f['course'].dropna().unique().tolist())
+    course_sel = st.selectbox("Filter by course (optional)", options=["All courses"] + courses_list, index=0)
 
-    scaler = MinMaxScaler()
-    norm = scaler.fit_transform(
-        prof_agg[["overall_score", "teaching_mean"]].fillna(0)
-    )
+    if course_sel == "All courses":
+        base_df = df_f.copy()
+        note = "Recommendations across all courses."
+    else:
+        base_df = df_f[df_f['course'] == course_sel].copy()
+        note = f"Recommendations restricted to course: {course_sel}"
 
-    prof_agg["rec_score"] = (
-        norm[:, 0] * w_overall +
-        norm[:, 1] * w_teaching
-    )
+    st.markdown(f"**Note:** {note}")
 
-    top = prof_agg.sort_values("rec_score", ascending=False).head(10)
+    if base_df.shape[0] == 0:
+        st.warning("No data available for the selected course.")
+    else:
+        prof_df = professor_aggregate(base_df).set_index('professor')
 
-    for _, r in top.iterrows():
-        st.markdown(f"### {r['professor']}")
-        st.write("Overall:", round(r["overall_score"], 2))
-        st.write("Teaching:", round(r["teaching_mean"], 2))
+        teaching_mean = base_df.groupby('professor')['teaching'].mean()
+        prof_df['teaching_mean'] = teaching_mean.reindex(prof_df.index).fillna(0).values
 
-        courses = (
-            df_f[df_f["professor"] == r["professor"]]["course"]
-            .value_counts()
-            .head(3)
-            .index
-            .tolist()
+        prof_df['mean_sentiment'] = prof_df['mean_sentiment'].fillna(0)
+
+        features_for_norm = prof_df[['overall_score', 'teaching_mean', 'mean_sentiment']].fillna(0).values
+        scaler = MinMaxScaler()
+        norm = scaler.fit_transform(features_for_norm)
+
+        prof_df['rec_score'] = (
+            norm[:, 0] * w_overall +
+            norm[:, 1] * w_teaching +
+            norm[:, 2] * w_sentiment
         )
-        st.write("Top courses:", "، ".join(courses))
-        st.markdown("---")
+
+        counts = base_df.groupby('professor').size().rename('n_comments_course')
+        prof_df['n_comments_course'] = counts.reindex(prof_df.index).fillna(0).astype(int).values
+
+        top_k = st.number_input("How many top professors to show", min_value=1, max_value=50, value=10, step=1)
+        top = prof_df.sort_values('rec_score', ascending=False).head(top_k)
+
+        st.subheader("Top recommendations")
+        for prof_name, row in top.iterrows():
+            st.markdown(f"### {prof_name}")
+            st.write("Recommendation score:", round(row['rec_score'], 3))
+            st.write("Overall score (on selected scope):", round(row['overall_score'], 2))
+            st.write("Teaching mean (on selected scope):", round(row['teaching_mean'], 2))
+            st.write("Mean sentiment (on selected scope):", round(row['mean_sentiment'], 2))
+            st.write("Comments for this scope:", int(row['n_comments_course']))
+            st.write("Most frequent grading:", safe_label(row.get('grading_mode', None)))
+
+            top_courses = (
+                df_f[df_f['professor'] == prof_name]['course']
+                .fillna('')
+                .value_counts()
+                .head(5)
+                .index
+                .tolist()
+            )
+            if top_courses:
+                st.write("Top courses (global):", "، ".join([c for c in top_courses if c]))
+            st.markdown("---")
